@@ -22,16 +22,13 @@ import json
 import io
 import os
 import re
-from anthropic import Anthropic
 from datetime import datetime, timedelta
-from collections import defaultdict
 from typing import Optional
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════
 DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN", "")
-ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # opcional — sube el rate limit de 60 → 5000 req/h
 
 REPO_OWNER   = "MaximumADHD"
@@ -41,7 +38,6 @@ REPO_TREE    = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees
 RAW_BASE     = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{REPO_BRANCH}/"
 
 CACHE_TTL          = timedelta(hours=6)   # Refresca cada 6 horas
-MAX_CONV_TURNS     = 8                    # Turnos de conversación guardados por usuario
 RESULTS_PER_PAGE   = 10                   # Flags por página en /buscar
 
 # Colores para embeds
@@ -57,10 +53,6 @@ C_CYAN    = 0x00B4D8
 flags_db:      dict[str, str]     = {}   # flag → valor
 flags_sources: dict[str, str]     = {}   # flag → plataforma
 flags_updated: Optional[datetime] = None
-
-conversations: dict[str, list] = defaultdict(list)   # uid → historial
-
-ai = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -180,25 +172,6 @@ def parse_user_file(text: str) -> dict:
                     result[k] = v
                 break
     return result
-
-
-def find_mentioned_flags(text: str) -> dict[str, dict]:
-    """Detecta flags mencionadas en un texto, exactas o case-insensitive."""
-    tokens   = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", text)
-    lower_map = {k.lower(): k for k in flags_db}
-    found: dict[str, dict] = {}
-    for t in tokens:
-        key = None
-        if t in flags_db:
-            key = t
-        elif t.lower() in lower_map:
-            key = lower_map[t.lower()]
-        if key and key not in found:
-            found[key] = {
-                "value": flags_db[key],
-                "platform": flags_sources.get(key, "?"),
-            }
-    return found
 
 # ══════════════════════════════════════════════════════════════════
 # VISTA — PAGINACIÓN DE RESULTADOS
@@ -449,147 +422,6 @@ async def cmd_limpiar(
     await interaction.followup.send(embed=embed, files=out_files)
 
 # ══════════════════════════════════════════════════════════════════
-# COMANDO 3 — /preguntar
-# ══════════════════════════════════════════════════════════════════
-_SYSTEM_PROMPT = """Eres un experto técnico especializado en las Fast Flags (FFlags) de Roblox.
-
-== TIPOS DE FLAGS ==
-• FFlag / DFFlag   → Booleano (true / false)
-• FInt  / DFInt    → Entero
-• FString          → Texto
-• FLog  / DFLog    → Nivel de logging
-• F = estático  |  D (Dynamic) = puede cambiar en runtime sin reiniciar cliente
-
-== FORMATO DE RESPUESTA PARA CADA FLAG ==
-Cuando el usuario pregunte por una flag específica, usa SIEMPRE esta estructura:
-
-## 🏷️ [NombreDeLaFlag]
-**¿Qué hace?** — Descripción técnica precisa del efecto en el cliente/juego
-**Tipo:** [Booleano / Entero / String / Log]
-**Valor default (repositorio):** `[valor actual en el repo oficial]`
-**Valor máximo recomendado:** `[número / true / false — o "N/A" si no aplica]`
-**Categoría:** [Gráficos 🎨 / Rendimiento ⚡ / Red 🌐 / Físicas 🏗️ / Audio 🔊 / UI 🖥️ / Debug 🐛]
-**Impacto:** [Bajo / Medio / Alto]
-**⚠️ Riesgos:** [Si puede causar baneos, crashes, bugs o inestabilidad — o "Ninguno conocido"]
-
-== REGLAS ==
-- Si preguntan por múltiples flags, responde CADA UNA por separado con la estructura anterior.
-- Si NO conoces con certeza una flag, dilo: "No tengo información fiable sobre esta flag."
-- NUNCA inventes valores, comportamientos o efectos que no conoces.
-- Si el repositorio te da el valor default, úsalo como referencia exacta.
-- Para preguntas generales sobre FFlags (qué son, cómo funcionan, etc.), responde con precisión técnica.
-- Siempre menciona si una flag es peligrosa de modificar.
-
-Responde SIEMPRE en español. Usa markdown. Sé preciso y técnico pero entendible."""
-
-
-@bot.tree.command(
-    name="preguntar",
-    description="💬 Pregunta a la IA qué hacen las flags, valores default, máximos y efectos"
-)
-@app_commands.describe(
-    pregunta="¿Qué quieres saber? Puedes escribir nombres de flags específicas",
-    nueva="Inicia una nueva conversación (borra tu historial anterior)",
-)
-async def cmd_preguntar(
-    interaction: discord.Interaction,
-    pregunta: str,
-    nueva: bool = False,
-):
-    await interaction.response.defer(thinking=True)
-
-    if not ai:
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="❌ IA no configurada",
-                description=(
-                    "El comando `/preguntar` necesita `ANTHROPIC_API_KEY` en el `.env`.\n"
-                    "Ver el `README.md` para configurarlo."
-                ),
-                color=C_RED,
-            )
-        )
-        return
-
-    if not flags_db:
-        await refresh_flags()
-
-    uid = str(interaction.user.id)
-    if nueva:
-        conversations[uid] = []
-
-    # ── Detectar flags mencionadas y construir contexto ─────────
-    mentioned = find_mentioned_flags(pregunta)
-
-    if mentioned:
-        ctx_lines = ["**Flags encontradas en el repositorio oficial:**"]
-        for name, info in mentioned.items():
-            ctx_lines.append(f"- `{name}` = `{info['value']}` (plataforma: `{info['platform']}`)")
-        context_block = "\n".join(ctx_lines)
-        user_content  = f"{context_block}\n\n**Pregunta del usuario:** {pregunta}"
-    else:
-        user_content = pregunta
-
-    # ── Construir historial + nuevo mensaje ─────────────────────
-    history  = conversations[uid]
-    messages = history + [{"role": "user", "content": user_content}]
-
-    try:
-        resp   = ai.messages.create(
-            model      = "claude-sonnet-4-20250514",
-            max_tokens = 1500,
-            system     = _SYSTEM_PROMPT,
-            messages   = messages,
-        )
-        answer = resp.content[0].text
-
-        # Actualizar historial (guardamos la pregunta original, sin contexto extra)
-        conversations[uid].append({"role": "user",      "content": pregunta})
-        conversations[uid].append({"role": "assistant", "content": answer})
-
-        # Limitar a MAX_CONV_TURNS intercambios
-        max_msgs = MAX_CONV_TURNS * 2
-        if len(conversations[uid]) > max_msgs:
-            conversations[uid] = conversations[uid][-max_msgs:]
-
-        # ── Embed de respuesta ──────────────────────────────────
-        embed = discord.Embed(title="💬 Respuesta sobre FFlags", color=C_CYAN)
-        embed.set_author(
-            name=f"{interaction.user.display_name} preguntó:",
-            icon_url=interaction.user.display_avatar.url,
-        )
-
-        # Discord permite hasta ~4000 chars en description
-        if len(answer) <= 4000:
-            embed.description = answer
-        else:
-            embed.description = answer[:3990] + "\n\n*…[respuesta cortada por límite de Discord]*"
-
-        # Mostrar flags que se analizaron
-        if mentioned:
-            flags_preview = "\n".join(
-                f"`{k}` = `{v['value']}` · `{v['platform']}`"
-                for k, v in list(mentioned.items())[:5]
-            )
-            embed.add_field(name="📌 Flags en el repositorio:", value=flags_preview, inline=False)
-
-        turn = len(conversations[uid]) // 2
-        embed.set_footer(
-            text=f"Turno {turn}/{MAX_CONV_TURNS} · Escribe /preguntar nueva:True para reiniciar · {len(flags_db):,} flags en BD"
-        )
-
-        await interaction.followup.send(embed=embed)
-
-    except Exception as e:
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="❌ Error de IA",
-                description=f"```{str(e)[:800]}```",
-                color=C_RED,
-            )
-        )
-
-# ══════════════════════════════════════════════════════════════════
 # COMANDO /estado
 # ══════════════════════════════════════════════════════════════════
 @bot.tree.command(name="estado", description="📊 Estado del bot y la base de datos de flags")
@@ -657,9 +489,6 @@ async def cmd_actualizar(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN no está configurado en el .env o variables de entorno.")
-
-    if not ANTHROPIC_KEY:
-        print("⚠️  ANTHROPIC_API_KEY no configurado — el comando /preguntar estará deshabilitado.")
 
     auto_refresh.start()
     bot.run(DISCORD_TOKEN, log_handler=None)
