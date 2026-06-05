@@ -21,15 +21,18 @@ import aiohttp
 import json
 import io
 import os
-import re
 from datetime import datetime, timedelta
 from typing import Optional
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════
-DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN", "")
-GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # opcional — sube el rate limit de 60 → 5000 req/h
+DISCORD_TOKEN        = os.getenv("DISCORD_TOKEN", "")
+GITHUB_TOKEN         = os.getenv("GITHUB_TOKEN", "")   # opcional — sube el rate limit de 60 → 5000 req/h
+
+# ── Restricciones de servidor y canal ───────────────────────────
+GUILD_ID             = int(os.getenv("GUILD_ID", "0"))           # ID de tu servidor de Discord
+ALLOWED_CHANNEL_ID   = int(os.getenv("ALLOWED_CHANNEL_ID", "0")) # ID del canal donde funcionará el bot
 
 REPO_OWNER   = "MaximumADHD"
 REPO_NAME    = "Roblox-FFlag-Tracker"
@@ -57,6 +60,23 @@ flags_updated: Optional[datetime] = None
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ══════════════════════════════════════════════════════════════════
+# VERIFICACIÓN DE CANAL
+# ══════════════════════════════════════════════════════════════════
+async def check_channel(interaction: discord.Interaction) -> bool:
+    """Verifica que el comando se use en el canal permitido."""
+    if ALLOWED_CHANNEL_ID and interaction.channel_id != ALLOWED_CHANNEL_ID:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="❌ Canal no permitido",
+                description=f"Este bot solo funciona en <#{ALLOWED_CHANNEL_ID}>.",
+                color=C_RED,
+            ),
+            ephemeral=True,
+        )
+        return False
+    return True
 
 # ══════════════════════════════════════════════════════════════════
 # CARGA DE FLAGS DESDE GITHUB
@@ -207,7 +227,6 @@ class FlagSearchView(discord.ui.View):
             lines.append(f"**`{k}`**\nValor: `{dv}` · `{src}`")
 
         field_val = "\n\n".join(lines) or "Sin resultados"
-        # Truncar si supera límite de Discord (1024 chars por campo)
         if len(field_val) > 1020:
             field_val = field_val[:1017] + "…"
 
@@ -241,11 +260,20 @@ class FlagSearchView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"\n[Bot] ✅ Conectado como {bot.user}  (ID: {bot.user.id})")
+    print(f"[Bot] Servidor objetivo: {GUILD_ID}")
+    print(f"[Bot] Canal permitido: {ALLOWED_CHANNEL_ID}")
     print("[Bot] Cargando flags...")
     await refresh_flags()
+
+    # Sincronizar comandos solo en el servidor especificado (más rápido)
     try:
-        synced = await bot.tree.sync()
-        print(f"[Bot] ✅ {len(synced)} comandos sincronizados\n")
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"[Bot] ✅ {len(synced)} comandos sincronizados en GUILD {GUILD_ID}\n")
+        else:
+            synced = await bot.tree.sync()
+            print(f"[Bot] ✅ {len(synced)} comandos sincronizados globalmente\n")
     except Exception as e:
         print(f"[Bot] ❌ Error al sincronizar comandos: {e}\n")
 
@@ -261,9 +289,16 @@ async def _before():
 # ══════════════════════════════════════════════════════════════════
 # COMANDO 1 — /buscar
 # ══════════════════════════════════════════════════════════════════
-@bot.tree.command(name="buscar", description="🔍 Busca flags de Roblox por nombre o palabra clave")
+@bot.tree.command(
+    name="buscar",
+    description="🔍 Busca flags de Roblox por nombre o palabra clave",
+    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
+)
 @app_commands.describe(nombre="Parte del nombre de la flag (ej: FPS, Render, Shadow, Network...)")
 async def cmd_buscar(interaction: discord.Interaction, nombre: str):
+    if not await check_channel(interaction):
+        return
+
     await interaction.response.defer(thinking=True)
 
     if not flags_db:
@@ -296,7 +331,8 @@ async def cmd_buscar(interaction: discord.Interaction, nombre: str):
 # ══════════════════════════════════════════════════════════════════
 @bot.tree.command(
     name="limpiar",
-    description="🧹 Sube tu archivo de flags — elimina las inválidas y descarga el JSON limpio"
+    description="🧹 Sube tu archivo de flags — elimina las inválidas y descarga el JSON limpio",
+    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
 )
 @app_commands.describe(
     archivo="Tu archivo .json o .txt con flags de Roblox",
@@ -312,6 +348,9 @@ async def cmd_limpiar(
     archivo: discord.Attachment,
     formato: str = "json",
 ):
+    if not await check_channel(interaction):
+        return
+
     await interaction.response.defer(thinking=True)
 
     # ── Validaciones básicas ────────────────────────────────────
@@ -424,8 +463,15 @@ async def cmd_limpiar(
 # ══════════════════════════════════════════════════════════════════
 # COMANDO /estado
 # ══════════════════════════════════════════════════════════════════
-@bot.tree.command(name="estado", description="📊 Estado del bot y la base de datos de flags")
+@bot.tree.command(
+    name="estado",
+    description="📊 Estado del bot y la base de datos de flags",
+    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
+)
 async def cmd_estado(interaction: discord.Interaction):
+    if not await check_channel(interaction):
+        return
+
     embed = discord.Embed(title="📊 Estado del Bot", color=C_BLUE)
 
     if flags_db:
@@ -452,8 +498,15 @@ async def cmd_estado(interaction: discord.Interaction):
 # ══════════════════════════════════════════════════════════════════
 # COMANDO /actualizar
 # ══════════════════════════════════════════════════════════════════
-@bot.tree.command(name="actualizar", description="🔄 Fuerza la actualización del caché de flags desde GitHub")
+@bot.tree.command(
+    name="actualizar",
+    description="🔄 Fuerza la actualización del caché de flags desde GitHub",
+    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
+)
 async def cmd_actualizar(interaction: discord.Interaction):
+    if not await check_channel(interaction):
+        return
+
     await interaction.response.defer(thinking=True)
 
     prev = len(flags_db)
@@ -489,6 +542,12 @@ async def cmd_actualizar(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN no está configurado en el .env o variables de entorno.")
+
+    if not GUILD_ID:
+        print("⚠️  GUILD_ID no configurado — los comandos se sincronizarán globalmente (puede tardar hasta 1 hora).")
+
+    if not ALLOWED_CHANNEL_ID:
+        print("⚠️  ALLOWED_CHANNEL_ID no configurado — el bot funcionará en cualquier canal.")
 
     auto_refresh.start()
     bot.run(DISCORD_TOKEN, log_handler=None)
