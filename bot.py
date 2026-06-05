@@ -257,6 +257,10 @@ async def on_ready():
     print("[Bot] Cargando flags...")
     await refresh_flags()
 
+    # Iniciar el auto-refresh AHORA que el loop está corriendo
+    auto_refresh.start()
+    print("[Bot] ✅ Auto-refresh iniciado")
+
     # Sincronizar comandos solo en el servidor especificado (más rápido)
     try:
         if GUILD_ID:
@@ -541,5 +545,4 @@ if __name__ == "__main__":
     if not ALLOWED_CHANNEL_ID:
         print("⚠️  ALLOWED_CHANNEL_ID no configurado — el bot funcionará en cualquier canal.")
 
-    auto_refresh.start()
     bot.run(DISCORD_TOKEN, log_handler=None)
