@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║         🎮 Roblox FFlag Tracker — Discord Bot                ║
@@ -28,7 +27,6 @@ from typing import Optional
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════
 DISCORD_TOKEN        = os.getenv("DISCORD_TOKEN", "")
-GITHUB_TOKEN         = os.getenv("GITHUB_TOKEN", "")   # opcional — sube el rate limit de 60 → 5000 req/h
 
 # ── Restricciones de servidor y canal ───────────────────────────
 GUILD_ID             = int(os.getenv("GUILD_ID", "0"))           # ID de tu servidor de Discord
@@ -81,12 +79,6 @@ async def check_channel(interaction: discord.Interaction) -> bool:
 # ══════════════════════════════════════════════════════════════════
 # CARGA DE FLAGS DESDE GITHUB
 # ══════════════════════════════════════════════════════════════════
-def _headers() -> dict:
-    h = {"Accept": "application/vnd.github.v3+json"}
-    if GITHUB_TOKEN:
-        h["Authorization"] = f"token {GITHUB_TOKEN}"
-    return h
-
 async def refresh_flags(force: bool = False) -> bool:
     global flags_db, flags_sources, flags_updated
 
@@ -97,9 +89,9 @@ async def refresh_flags(force: bool = False) -> bool:
     try:
         async with aiohttp.ClientSession() as sess:
             # 1) Obtener árbol de archivos
-            async with sess.get(REPO_TREE, headers=_headers()) as r:
+            async with sess.get(REPO_TREE) as r:
                 if r.status == 403:
-                    print("[Flags] Rate limit de GitHub alcanzado — configura GITHUB_TOKEN")
+                    print("[Flags] Rate limit de GitHub alcanzado (60 req/h). Espera un poco o intenta más tarde.")
                     return False
                 if r.status != 200:
                     print(f"[Flags] Error en GitHub API: {r.status}")
@@ -528,8 +520,8 @@ async def cmd_actualizar(interaction: discord.Interaction):
             title="❌ Error al actualizar",
             description=(
                 "No se pudo conectar al repositorio.\n"
-                "• Verifica tu `GITHUB_TOKEN` si tienes uno configurado.\n"
-                "• GitHub podría tener un rate limit activo."
+                "• GitHub podría tener un rate limit activo (60 req/h sin token).\n"
+                "• Espera unos minutos y vuelve a intentarlo."
             ),
             color=C_RED,
         )
