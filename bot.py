@@ -6,7 +6,6 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-# ── Cargar .env automáticamente si existe ──────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -17,6 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
+import asyncio
 import json
 import io
 import os
@@ -27,9 +27,8 @@ from typing import Optional
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════
 DISCORD_TOKEN        = os.getenv("DISCORD_TOKEN", "")
-GITHUB_TOKEN         = os.getenv("GITHUB_TOKEN", "")   # ← AÑADIDO DE VUELTA
+GITHUB_TOKEN         = os.getenv("GITHUB_TOKEN", "")
 
-# ── Restricciones de servidor y canal ───────────────────────────
 GUILD_ID             = int(os.getenv("GUILD_ID", "0"))
 ALLOWED_CHANNEL_ID   = int(os.getenv("ALLOWED_CHANNEL_ID", "0"))
 
@@ -41,8 +40,9 @@ RAW_BASE     = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{REP
 
 CACHE_TTL          = timedelta(hours=6)
 RESULTS_PER_PAGE   = 10
+MAX_CONCURRENT     = 15   # Descargas simultáneas máximas
 
-# Colores para embeds
+# Colores
 C_BLUE    = 0x5865F2
 C_GREEN   = 0x57F287
 C_RED     = 0xED4245
@@ -64,7 +64,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # VERIFICACIÓN DE CANAL
 # ══════════════════════════════════════════════════════════════════
 async def check_channel(interaction: discord.Interaction) -> bool:
-    """Verifica que el comando se use en el canal permitido."""
     if ALLOWED_CHANNEL_ID and interaction.channel_id != ALLOWED_CHANNEL_ID:
         await interaction.response.send_message(
             embed=discord.Embed(
@@ -78,13 +77,31 @@ async def check_channel(interaction: discord.Interaction) -> bool:
     return True
 
 # ══════════════════════════════════════════════════════════════════
-# CARGA DE FLAGS DESDE GITHUB
+# CARGA DE FLAGS — CONCURRENTE Y CON PROGRESO
 # ══════════════════════════════════════════════════════════════════
 def _headers() -> dict:
     h = {"Accept": "application/vnd.github.v3+json"}
     if GITHUB_TOKEN:
         h["Authorization"] = f"token {GITHUB_TOKEN}"
     return h
+
+async def _download_one(sess: aiohttp.ClientSession, item: dict, sem: asyncio.Semaphore) -> tuple[str, str, dict]:
+    """Descarga un archivo JSON y devuelve (plataforma, path, data_dict)."""
+    path     = item["path"]
+    platform = os.path.splitext(os.path.basename(path))[0]
+    url      = RAW_BASE + path
+
+    async with sem:
+        try:
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status == 200:
+                    text = await r.text()
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        return platform, path, data
+        except Exception as e:
+            print(f"[Flags] ⚠️ Error en {path}: {e}")
+    return platform, path, {}
 
 async def refresh_flags(force: bool = False) -> bool:
     global flags_db, flags_sources, flags_updated
@@ -94,13 +111,17 @@ async def refresh_flags(force: bool = False) -> bool:
 
     print("[Flags] Actualizando caché desde GitHub...")
     try:
-        async with aiohttp.ClientSession() as sess:
-            # 1) Obtener árbol de archivos
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            # 1) Obtener árbol
             async with sess.get(REPO_TREE, headers=_headers()) as r:
                 if r.status == 403:
                     print("[Flags] ⚠️ Rate limit de GitHub alcanzado.")
-                    print("[Flags]    Sin token: 60 req/hora | Con token: 5,000 req/hora")
-                    print("[Flags]    Configura GITHUB_TOKEN en Railway para arreglarlo.")
+                    print("[Flags]    Verifica que tu GITHUB_TOKEN esté activo y no expirado.")
+                    return False
+                if r.status == 401:
+                    print("[Flags] ❌ Token de GitHub inválido (401 Unauthorized).")
+                    print("[Flags]    Revisa que el token sea 'classic' con scope 'public_repo'.")
                     return False
                 if r.status != 200:
                     print(f"[Flags] Error en GitHub API: {r.status}")
@@ -111,41 +132,28 @@ async def refresh_flags(force: bool = False) -> bool:
                 f for f in tree.get("tree", [])
                 if f["type"] == "blob" and f["path"].endswith(".json")
             ]
-            print(f"[Flags] {len(json_files)} archivos JSON encontrados")
+            print(f"[Flags] 📁 {len(json_files):,} archivos JSON encontrados en el árbol")
 
-            # Protección: si hay más de 500 archivos, algo va mal
-            if len(json_files) > 500:
-                print(f"[Flags] ⚠️ Demasiados archivos ({len(json_files)}). Usando solo los primeros 100.")
-                json_files = json_files[:100]
+            # 2) Descargar todo en paralelo controlado
+            sem = asyncio.Semaphore(MAX_CONCURRENT)
+            tasks = [_download_one(sess, item, sem) for item in json_files]
+            results = await asyncio.gather(*tasks)
 
             new_db: dict[str, str] = {}
             new_src: dict[str, str] = {}
 
-            # 2) Descargar cada archivo
-            for i, item in enumerate(json_files, 1):
-                path     = item["path"]
-                platform = os.path.splitext(os.path.basename(path))[0]
-                url      = RAW_BASE + path
-                try:
-                    async with sess.get(url) as r:
-                        if r.status == 200:
-                            data = json.loads(await r.text())
-                            if isinstance(data, dict):
-                                for k, v in data.items():
-                                    if k not in new_db:
-                                        new_db[k]  = str(v)
-                                        new_src[k] = platform
-                except Exception as e:
-                    print(f"[Flags] Error en {path}: {e}")
-
-                # Log de progreso cada 50 archivos
-                if i % 50 == 0:
-                    print(f"[Flags] Progreso: {i}/{len(json_files)} archivos...")
+            for i, (platform, path, data) in enumerate(results, 1):
+                for k, v in data.items():
+                    if k not in new_db:
+                        new_db[k]  = str(v)
+                        new_src[k] = platform
+                if i % 500 == 0:
+                    print(f"[Flags] ⏳ Procesados {i}/{len(json_files)} archivos...")
 
         flags_db      = new_db
         flags_sources = new_src
         flags_updated = datetime.now()
-        print(f"[Flags] ✅ {len(new_db):,} flags únicas de {len(json_files)} archivos")
+        print(f"[Flags] ✅ {len(new_db):,} flags únicas de {len(json_files):,} archivos")
         return True
 
     except Exception as e:
@@ -162,12 +170,10 @@ def search_flags(query: str) -> dict[str, str]:
     contain = {k: v for k, v in flags_db.items() if q in k.lower() and not k.lower().startswith(q)}
     return {**exact, **starts, **contain}
 
-
 def validate_flags(user_flags: dict) -> tuple[dict, list]:
     valid   = {k: v for k, v in user_flags.items() if k in flags_db}
     invalid = [k for k in user_flags if k not in flags_db]
     return valid, invalid
-
 
 def parse_user_file(text: str) -> dict:
     try:
@@ -195,7 +201,7 @@ def parse_user_file(text: str) -> dict:
     return result
 
 # ══════════════════════════════════════════════════════════════════
-# VISTA — PAGINACIÓN DE RESULTADOS
+# VISTA — PAGINACIÓN
 # ══════════════════════════════════════════════════════════════════
 class FlagSearchView(discord.ui.View):
     def __init__(self, results: dict[str, str], query: str):
@@ -256,7 +262,7 @@ class FlagSearchView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 # ══════════════════════════════════════════════════════════════════
-# EVENTOS DEL BOT
+# EVENTOS
 # ══════════════════════════════════════════════════════════════════
 @bot.event
 async def on_ready():
@@ -290,108 +296,68 @@ async def _before():
     await bot.wait_until_ready()
 
 # ══════════════════════════════════════════════════════════════════
-# COMANDO 1 — /buscar
+# COMANDOS
 # ══════════════════════════════════════════════════════════════════
-@bot.tree.command(
-    name="buscar",
-    description="🔍 Busca flags de Roblox por nombre o palabra clave",
-    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
-)
-@app_commands.describe(nombre="Parte del nombre de la flag (ej: FPS, Render, Shadow, Network...)")
+@bot.tree.command(name="buscar", description="🔍 Busca flags de Roblox por nombre", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+@app_commands.describe(nombre="Parte del nombre de la flag (ej: FPS, Render, Shadow...)")
 async def cmd_buscar(interaction: discord.Interaction, nombre: str):
     if not await check_channel(interaction):
         return
-
     await interaction.response.defer(thinking=True)
 
     if not flags_db:
         if not await refresh_flags():
-            await interaction.followup.send(
-                embed=discord.Embed(title="❌ Sin conexión", description="No se pudo conectar al repositorio.", color=C_RED)
-            )
+            await interaction.followup.send(embed=discord.Embed(title="❌ Sin conexión", description="No se pudo conectar al repositorio.", color=C_RED))
             return
 
     results = search_flags(nombre)
-
     if not results:
         await interaction.followup.send(
             embed=discord.Embed(
                 title="❌ Sin resultados",
-                description=(
-                    f"No hay flags que contengan `{nombre}`.\n\n"
-                    "💡 **Sugerencias:** `FPS`, `Render`, `Shadow`, `Network`, `Graphics`, `Physics`"
-                ),
+                description=f"No hay flags que contengan `{nombre}`.\n\n💡 **Sugerencias:** `FPS`, `Render`, `Shadow`, `Network`, `Graphics`, `Physics`",
                 color=C_RED,
             )
         )
         return
 
-    view  = FlagSearchView(results, nombre)
+    view = FlagSearchView(results, nombre)
     await interaction.followup.send(embed=view.build_embed(), view=view)
 
-# ══════════════════════════════════════════════════════════════════
-# COMANDO 2 — /limpiar
-# ══════════════════════════════════════════════════════════════════
-@bot.tree.command(
-    name="limpiar",
-    description="🧹 Sube tu archivo de flags — elimina las inválidas y descarga el JSON limpio",
-    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
-)
-@app_commands.describe(
-    archivo="Tu archivo .json o .txt con flags de Roblox",
-    formato="Formato del archivo de salida (JSON por defecto)",
-)
+@bot.tree.command(name="limpiar", description="🧹 Sube tu archivo de flags y elimina las inválidas", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+@app_commands.describe(archivo="Tu archivo .json o .txt", formato="Formato de salida")
 @app_commands.choices(formato=[
-    app_commands.Choice(name="JSON   (.json)",    value="json"),
-    app_commands.Choice(name="Texto  (.txt)",     value="txt"),
-    app_commands.Choice(name="Ambos  (.json + .txt)", value="both"),
+    app_commands.Choice(name="JSON (.json)", value="json"),
+    app_commands.Choice(name="Texto (.txt)", value="txt"),
+    app_commands.Choice(name="Ambos", value="both"),
 ])
-async def cmd_limpiar(
-    interaction: discord.Interaction,
-    archivo: discord.Attachment,
-    formato: str = "json",
-):
+async def cmd_limpiar(interaction: discord.Interaction, archivo: discord.Attachment, formato: str = "json"):
     if not await check_channel(interaction):
         return
-
     await interaction.response.defer(thinking=True)
 
     if not (archivo.filename.endswith(".json") or archivo.filename.endswith(".txt")):
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="❌ Formato no soportado",
-                description="Solo acepto archivos **`.json`** o **`.txt`**.",
-                color=C_RED,
-            )
-        )
+        await interaction.followup.send(embed=discord.Embed(title="❌ Formato no soportado", description="Solo `.json` o `.txt`.", color=C_RED))
         return
-
     if archivo.size > 2_097_152:
-        await interaction.followup.send(
-            embed=discord.Embed(title="❌ Archivo muy grande", description="Máximo **2 MB**.", color=C_RED)
-        )
+        await interaction.followup.send(embed=discord.Embed(title="❌ Archivo muy grande", description="Máximo **2 MB**.", color=C_RED))
         return
 
     try:
-        raw  = await archivo.read()
+        raw = await archivo.read()
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("latin-1", errors="replace")
     except Exception as e:
-        await interaction.followup.send(f"❌ No se pudo leer el archivo: `{e}`")
+        await interaction.followup.send(f"❌ Error al leer: `{e}`")
         return
 
     user_flags = parse_user_file(text)
-
     if not user_flags:
         await interaction.followup.send(
             embed=discord.Embed(
-                title="❌ Archivo vacío o sin formato reconocido",
-                description=(
-                    "**Formatos soportados:**\n"
-                    "```json\n{\"FlagName\": \"valor\"}\n```"
-                    "```\nFlagName = valor\n```"
-                ),
+                title="❌ Archivo vacío",
+                description="Formatos:\n```json\n{\"Flag\": \"valor\"}\n```\n```\nFlag = valor\n```",
                 color=C_RED,
             )
         )
@@ -402,134 +368,89 @@ async def cmd_limpiar(
 
     valid, invalid = validate_flags(user_flags)
     total = len(user_flags)
-    pct   = len(valid) / total * 100 if total else 0
+    pct = len(valid) / total * 100 if total else 0
 
-    out_files: list[discord.File] = []
-
+    out_files = []
     if valid:
         if formato in ("json", "both"):
-            out_files.append(discord.File(
-                io.BytesIO(json.dumps(valid, indent=2).encode()),
-                filename="flags_validas.json",
-            ))
+            out_files.append(discord.File(io.BytesIO(json.dumps(valid, indent=2).encode()), "flags_validas.json"))
         if formato in ("txt", "both"):
-            txt_content = "\n".join(f"{k} = {v}" for k, v in valid.items())
-            out_files.append(discord.File(
-                io.BytesIO(txt_content.encode()),
-                filename="flags_validas.txt",
-            ))
+            out_files.append(discord.File(io.BytesIO("\n".join(f"{k} = {v}" for k, v in valid.items()).encode()), "flags_validas.txt"))
 
     if invalid:
-        header = (
-            "# Flags eliminadas — no existen en el repositorio MaximumADHD/Roblox-FFlag-Tracker\n"
-            f"# Total: {len(invalid)}\n\n"
-        )
-        inv_content = header + "\n".join(invalid)
-        out_files.append(discord.File(
-            io.BytesIO(inv_content.encode()),
-            filename="flags_invalidas.txt",
-        ))
+        header = f"# Flags eliminadas — no existen en el repositorio\n# Total: {len(invalid)}\n\n"
+        out_files.append(discord.File(io.BytesIO((header + "\n".join(invalid)).encode()), "flags_invalidas.txt"))
 
     color = C_GREEN if valid else C_RED
     embed = discord.Embed(title="🧹 Limpieza completada", color=color)
-
-    embed.add_field(name="📥 Total enviadas",  value=f"**{total}**",                    inline=True)
-    embed.add_field(name="✅ Flags válidas",   value=f"**{len(valid)}** ({pct:.1f}%)",  inline=True)
-    embed.add_field(name="🗑️ Flags removidas", value=f"**{len(invalid)}**",             inline=True)
+    embed.add_field(name="📥 Total", value=f"**{total}**", inline=True)
+    embed.add_field(name="✅ Válidas", value=f"**{len(valid)}** ({pct:.1f}%)", inline=True)
+    embed.add_field(name="🗑️ Removidas", value=f"**{len(invalid)}**", inline=True)
 
     if not valid:
-        embed.description = "⚠️ **Ninguna flag** de tu archivo existe en el repositorio oficial de Roblox."
+        embed.description = "⚠️ Ninguna flag existe en el repositorio oficial."
     elif not invalid:
-        embed.description = "✨ **¡Perfecto!** Todas tus flags son válidas."
+        embed.description = "✨ ¡Perfecto! Todas son válidas."
     else:
-        embed.description = (
-            f"Se eliminaron **{len(invalid)}** flags no encontradas en el repositorio oficial.\n"
-            "Descarga los archivos adjuntos 👇"
-        )
+        embed.description = f"Se eliminaron **{len(invalid)}** flags no oficiales."
 
     if invalid:
         preview = "\n".join(f"• `{f}`" for f in invalid[:12])
         if len(invalid) > 12:
-            preview += f"\n• … y **{len(invalid) - 12}** más (ver `flags_invalidas.txt`)"
-        embed.add_field(name="🚫 Flags eliminadas:", value=preview, inline=False)
+            preview += f"\n• … y **{len(invalid) - 12}** más"
+        embed.add_field(name="🚫 Eliminadas:", value=preview, inline=False)
 
-    embed.set_footer(text=f"BD: {len(flags_db):,} flags  •  MaximumADHD/Roblox-FFlag-Tracker")
+    embed.set_footer(text=f"BD: {len(flags_db):,} flags")
     await interaction.followup.send(embed=embed, files=out_files)
 
-# ══════════════════════════════════════════════════════════════════
-# COMANDO /estado
-# ══════════════════════════════════════════════════════════════════
-@bot.tree.command(
-    name="estado",
-    description="📊 Estado del bot y la base de datos de flags",
-    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
-)
+@bot.tree.command(name="estado", description="📊 Estado del bot y la BD", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
 async def cmd_estado(interaction: discord.Interaction):
     if not await check_channel(interaction):
         return
 
     embed = discord.Embed(title="📊 Estado del Bot", color=C_BLUE)
-
     if flags_db:
         platforms = sorted(set(flags_sources.values()))
-        embed.add_field(name="✅ Flags cargadas",  value=f"**{len(flags_db):,}**", inline=True)
-        embed.add_field(name="📁 Plataformas",     value=f"**{len(platforms)}**",  inline=True)
-
+        embed.add_field(name="✅ Flags", value=f"**{len(flags_db):,}**", inline=True)
+        embed.add_field(name="📁 Plataformas", value=f"**{len(platforms)}**", inline=True)
         if flags_updated:
-            age    = datetime.now() - flags_updated
+            age = datetime.now() - flags_updated
             total_mins = int(age.total_seconds() // 60)
-            h, m   = divmod(total_mins, 60)
-            embed.add_field(name="🕐 Caché",  value=f"Hace **{h}h {m}m**", inline=True)
-
+            h, m = divmod(total_mins, 60)
+            embed.add_field(name="🕐 Caché", value=f"Hace **{h}h {m}m**", inline=True)
         plat_lines = "\n".join(f"• `{p}`" for p in platforms[:25])
         if len(platforms) > 25:
             plat_lines += f"\n• … y {len(platforms)-25} más"
-        embed.add_field(name="Plataformas indexadas:", value=plat_lines, inline=False)
+        embed.add_field(name="Plataformas:", value=plat_lines, inline=False)
     else:
-        embed.add_field(name="⚠️ Estado", value="Base de datos no cargada aún. Usa `/actualizar`.", inline=False)
+        embed.add_field(name="⚠️", value="BD no cargada. Usa `/actualizar`.", inline=False)
 
     embed.set_footer(text="github.com/MaximumADHD/Roblox-FFlag-Tracker")
     await interaction.response.send_message(embed=embed)
 
-# ══════════════════════════════════════════════════════════════════
-# COMANDO /actualizar
-# ══════════════════════════════════════════════════════════════════
-@bot.tree.command(
-    name="actualizar",
-    description="🔄 Fuerza la actualización del caché de flags desde GitHub",
-    guild=discord.Object(id=GUILD_ID) if GUILD_ID else None,
-)
+@bot.tree.command(name="actualizar", description="🔄 Fuerza actualización del caché", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
 async def cmd_actualizar(interaction: discord.Interaction):
     if not await check_channel(interaction):
         return
-
     await interaction.response.defer(thinking=True)
 
     prev = len(flags_db)
-    ok   = await refresh_flags(force=True)
+    ok = await refresh_flags(force=True)
 
     if ok:
         diff = len(flags_db) - prev
         sign = "+" if diff > 0 else ""
         embed = discord.Embed(
             title="✅ Caché actualizado",
-            description=(
-                f"**{len(flags_db):,}** flags cargadas\n"
-                f"Cambio respecto al caché anterior: `{sign}{diff}`"
-            ),
+            description=f"**{len(flags_db):,}** flags cargadas\nCambio: `{sign}{diff}`",
             color=C_GREEN,
         )
     else:
         embed = discord.Embed(
-            title="❌ Error al actualizar",
-            description=(
-                "No se pudo conectar al repositorio.\n"
-                "• Configura `GITHUB_TOKEN` en Railway para evitar rate limits.\n"
-                "• GitHub podría tener un rate limit activo (60 req/h sin token)."
-            ),
+            title="❌ Error",
+            description="No se pudo conectar.\n• Verifica `GITHUB_TOKEN`\n• Rate limit de GitHub",
             color=C_RED,
         )
-
     await interaction.followup.send(embed=embed)
 
 # ══════════════════════════════════════════════════════════════════
@@ -537,15 +458,13 @@ async def cmd_actualizar(interaction: discord.Interaction):
 # ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN no está configurado en el .env o variables de entorno.")
+        raise SystemExit("❌ DISCORD_TOKEN no está configurado.")
 
     if not GUILD_ID:
-        print("⚠️  GUILD_ID no configurado — los comandos se sincronizarán globalmente (puede tardar hasta 1 hora).")
-
+        print("⚠️ GUILD_ID no configurado — sincronización global (hasta 1h).")
     if not ALLOWED_CHANNEL_ID:
-        print("⚠️  ALLOWED_CHANNEL_ID no configurado — el bot funcionará en cualquier canal.")
-
+        print("⚠️ ALLOWED_CHANNEL_ID no configurado — funciona en cualquier canal.")
     if not GITHUB_TOKEN:
-        print("⚠️  GITHUB_TOKEN no configurado — el bot funcionará con límite de 60 peticiones/hora.")
+        print("⚠️ GITHUB_TOKEN no configurado — límite 60 req/h.")
 
     bot.run(DISCORD_TOKEN, log_handler=None)
